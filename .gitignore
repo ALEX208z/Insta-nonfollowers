@@ -1,0 +1,14 @@
+# python
+__pycache__/
+*.pyc
+env/
+venv/
+.env
+sessions/
+*.session
+output/
+sample_data/
+
+# OS
+.DS_Store
+Thumbs.db
