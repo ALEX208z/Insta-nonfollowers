@@ -1,14 +1,29 @@
-# python
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Instagram export files (keep your data private)
+followers_1.json
+followers_2.json
+following.json
+
+# Output CSVs (contain usernames — don't commit publicly)
+output/
+
+# Instaloader sessions (contain auth tokens)
+sessions/
+
+# Python cache
 __pycache__/
 *.pyc
-env/
-venv/
-.env
-sessions/
-*.session
-output/
-sample_data/
+*.pyo
+*.pyd
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
+
+# IDE
+.vscode/
+.idea/

@@ -1,145 +1,236 @@
 #!/usr/bin/env python3
 """enrich_and_sort.py
 
-Reads an input CSV with 'username' column (default: output/not_following_back.csv),
-fetches follower counts using Instaloader, and writes a sorted CSV (descending followers).
+Reads a CSV with a 'username' column (e.g. output/not_following_back.csv),
+fetches follower counts via Instaloader, and writes a new CSV sorted by
+follower count descending.
+
+Supports session reuse, resumption on interruption, and optional login for
+private accounts.
 
 Usage:
-    python enrich_and_sort.py --input output/not_following_back.csv --output output/not_following_back_sorted.csv
+    # Public profiles only (no login)
+    python enrich_and_sort.py --input output/not_following_back.csv
+
+    # With login (required to see follower counts on private accounts)
+    python enrich_and_sort.py --input output/not_following_back.csv --login
+
+    # Resume a previous interrupted run
+    python enrich_and_sort.py --input output/not_following_back.csv --resume
+
 Options:
-    --login : prompt for Instagram username + password to use a logged-in session (needed to see private accounts you follow)
-    --session-file : path to save/load instaloader session (default: sessions/<insta_username>.session)
-    --delay : seconds to wait between requests (default: 2)
-    --resume : if output file exists, resume from where left off
+    --input         Path to input CSV  (required)
+    --output        Path to output CSV  (default: output/not_following_back_sorted.csv)
+    --login         Prompt for Instagram credentials and save session
+    --session-file  Custom session file path
+    --delay         Seconds to wait between API requests  (default: 2.5)
+    --resume        Skip usernames already present in output file
 """
+
 import csv
 import argparse
 import time
-from pathlib import Path
+import sys
 import getpass
+from pathlib import Path
+from datetime import datetime
 
 try:
     import instaloader
-except Exception:
+except ImportError:
     instaloader = None
 
-def read_usernames_from_csv(path: Path):
+
+# ──────────────────────────────────────────────────────────────────────────────
+# I/O helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def read_usernames(path: Path):
     users = []
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        if "username" not in reader.fieldnames:
-            f.seek(0)
-            reader2 = csv.reader(f)
-            next(reader2, None)
-            for row in reader2:
-                if row:
-                    users.append(row[0].strip().lower())
-            return users
+        col = None
+        if reader.fieldnames:
+            for candidate in ("username", "user", "handle"):
+                if candidate in reader.fieldnames:
+                    col = candidate
+                    break
+            if col is None:
+                col = reader.fieldnames[0]
         for row in reader:
-            u = row.get("username") or row.get("user") or list(row.values())[0]
+            u = row.get(col, "").strip().lower()
             if u:
-                users.append(u.strip().lower())
+                users.append(u)
     return users
 
-def save_results_csv(path: Path, rows):
+
+def load_done(path: Path):
+    """Load already-processed usernames from a partial output CSV."""
+    done = {}
+    if not path.exists():
+        return done
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            uname = (row.get("username") or "").strip().lower()
+            if not uname:
+                continue
+            val = row.get("followers", "")
+            try:
+                done[uname] = int(str(val).replace(",", "")) if val not in ("", "N/A", None) else None
+            except (ValueError, TypeError):
+                done[uname] = None
+    return done
+
+
+def save_csv(path: Path, rows):
+    """Write sorted results to CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["username", "followers", "profile_link"])
-        for u, followers in rows:
-            w.writerow([u, followers if followers is not None else "N/A", f"https://instagram.com/{u}"])
+        writer = csv.writer(f)
+        writer.writerow(["username", "followers", "profile_link"])
+        for username, followers in rows:
+            writer.writerow([
+                username,
+                followers if followers is not None else "N/A",
+                f"https://www.instagram.com/{username}/",
+            ])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Instaloader session setup
+# ──────────────────────────────────────────────────────────────────────────────
+
+def setup_loader(login: bool, session_file_arg):
+    if instaloader is None:
+        print("❌  instaloader not found. Install it with:  pip install instaloader", file=sys.stderr)
+        sys.exit(1)
+
+    L = instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        save_metadata=False,
+        quiet=True,
+    )
+
+    if not login:
+        return L
+
+    insta_user = input("Instagram username (for session login): ").strip()
+    session_path = Path(session_file_arg) if session_file_arg else Path("sessions") / f"{insta_user}.session"
+
+    if session_path.exists():
+        try:
+            L.load_session_from_file(insta_user, filename=str(session_path))
+            print(f"✅  Loaded existing session from {session_path}")
+            return L
+        except Exception as e:
+            print(f"⚠️  Could not load session ({e}), logging in fresh ...")
+
+    password = getpass.getpass("Instagram password: ")
+    try:
+        L.login(insta_user, password)
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        L.save_session_to_file(filename=str(session_path))
+        print(f"✅  Session saved to {session_path}")
+    except Exception as e:
+        print(f"⚠️  Login failed: {e}. Continuing without authentication.")
+
+    return L
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fetcher
+# ──────────────────────────────────────────────────────────────────────────────
+
+def fetch_follower_count(L, username: str):
+    try:
+        profile = instaloader.Profile.from_username(L.context, username)
+        return getattr(profile, "followers", None)
+    except instaloader.exceptions.ProfileNotExistsException:
+        return None
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Enrich usernames with follower counts using Instaloader.")
-    parser.add_argument("--input", "-i", required=True, help="Input CSV path (must have 'username' column).")
-    parser.add_argument("--output", "-o", default="output/not_following_back_sorted.csv", help="Output CSV path.")
-    parser.add_argument("--login", action="store_true", help="Login to Instagram to access private accounts you follow.")
-    parser.add_argument("--session-file", default=None, help="Session file path (optional).")
-    parser.add_argument("--delay", type=float, default=2.0, help="Delay between requests (seconds).")
-    parser.add_argument("--resume", action="store_true", help="Resume if output already exists.")
+    parser = argparse.ArgumentParser(
+        description="Enrich a username CSV with Instagram follower counts, sorted descending.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  python enrich_and_sort.py --input output/not_following_back.csv
+  python enrich_and_sort.py --input output/not_following_back.csv --login --resume
+        """,
+    )
+    parser.add_argument("--input",   "-i", required=True,
+                        help="Input CSV path (must contain a 'username' column)")
+    parser.add_argument("--output",  "-o", default="output/not_following_back_sorted.csv",
+                        help="Output CSV path  (default: output/not_following_back_sorted.csv)")
+    parser.add_argument("--login",          action="store_true",
+                        help="Login to Instagram to see follower counts for private accounts")
+    parser.add_argument("--session-file",   default=None,
+                        help="Path to save/load Instaloader session  (default: sessions/<user>.session)")
+    parser.add_argument("--delay",          type=float, default=2.5,
+                        help="Delay between requests in seconds  (default: 2.5)")
+    parser.add_argument("--resume",         action="store_true",
+                        help="Resume from an existing partial output file")
     args = parser.parse_args()
 
-    if instaloader is None:
-        raise SystemExit("Error: instaloader library not found. Run `pip install instaloader` first.")
-
-    L = instaloader.Instaloader(download_pictures=False, download_videos=False, save_metadata=False)
-    session_file = None
-    if args.login:
-        insta_user = input("Instagram username for login (for private access): ").strip()
-        if args.session_file:
-            session_file = Path(args.session_file)
-        else:
-            session_file = Path("sessions") / f"{insta_user}.session"
-        if session_file.exists():
-            try:
-                L.load_session_from_file(insta_user, filename=str(session_file))
-                print(f"Loaded session from {session_file}")
-            except Exception as e:
-                print("Couldn't load session:", e)
-                passwd = getpass.getpass("Instagram password: ")
-                try:
-                    L.login(insta_user, passwd)
-                    session_file.parent.mkdir(parents=True, exist_ok=True)
-                    L.save_session_to_file(filename=str(session_file))
-                    print("Saved session to", session_file)
-                except Exception as ex:
-                    print("Login failed:", ex)
-        else:
-            passwd = getpass.getpass("Instagram password: ")
-            try:
-                L.login(insta_user, passwd)
-                session_file.parent.mkdir(parents=True, exist_ok=True)
-                L.save_session_to_file(filename=str(session_file))
-                print("Saved session to", session_file)
-            except Exception as ex:
-                print("Login failed:", ex)
-
-    input_path = Path(args.input)
+    input_path  = Path(args.input)
     output_path = Path(args.output)
 
-    users = read_usernames_from_csv(input_path)
-    print(f"Loaded {len(users)} usernames from {input_path}")
+    if not input_path.exists():
+        print(f"❌  Input file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    L    = setup_loader(args.login, args.session_file)
+    users = read_usernames(input_path)
+    print(f"\n📋  Loaded {len(users)} usernames from {input_path}")
 
     done = {}
-    if args.resume and output_path.exists():
-        with open(output_path, "r", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                uname = row.get("username")
-                if uname:
-                    val = row.get("followers")
-                    try:
-                        valnum = int(val.replace(",", "")) if val not in (None, "", "N/A") else None
-                    except Exception:
-                        valnum = None
-                    done[uname.lower()] = valnum
-        print(f"Resuming: found {len(done)} already-fetched users in {output_path}")
+    if args.resume:
+        done = load_done(output_path)
+        if done:
+            print(f"🔄  Resuming: {len(done)} usernames already cached from {output_path}")
 
     results = []
-    total = len(users)
-    for idx, u in enumerate(users, start=1):
-        if u in done:
-            results.append((u, done[u]))
-            print(f"[{idx}/{total}] {u} → (cached) {done[u]}")
+    total   = len(users)
+    start   = datetime.now()
+
+    for idx, username in enumerate(users, start=1):
+        if username in done:
+            results.append((username, done[username]))
+            print(f"  [{idx:>{len(str(total))}}/{total}]  {username:<30}  (cached)  {done[username] or 'N/A'}")
             continue
-        print(f"[{idx}/{total}] Fetching {u} ...")
-        followers_count = None
-        try:
-            profile = instaloader.Profile.from_username(L.context, u)
-            followers_count = getattr(profile, "followers", None)
-        except Exception as e:
-            print(f"  warning: couldn't fetch {u}: {e}")
-            followers_count = None
-        results.append((u, followers_count))
+
+        count = fetch_follower_count(L, username)
+        results.append((username, count))
+        label = f"{count:,}" if count is not None else "private/not found"
+        print(f"  [{idx:>{len(str(total))}}/{total}]  {username:<30}  {label}")
+
+        # Auto-save every 20 fetches to protect against interruption
         if idx % 20 == 0:
-            tmp_sorted = sorted(results, key=lambda x: x[1] or 0, reverse=True)
-            save_results_csv(output_path, tmp_sorted)
-            print(f"  partial results saved to {output_path} (after {idx} users)")
+            partial = sorted(results, key=lambda x: x[1] or 0, reverse=True)
+            save_csv(output_path, partial)
+            elapsed = (datetime.now() - start).seconds
+            print(f"    💾  Auto-saved {len(results)} results  ({elapsed}s elapsed)")
+
         time.sleep(args.delay)
 
     sorted_results = sorted(results, key=lambda x: x[1] or 0, reverse=True)
-    save_results_csv(output_path, sorted_results)
-    print("✅ Done. Saved sorted results to", output_path)
+    save_csv(output_path, sorted_results)
+
+    elapsed = (datetime.now() - start).seconds
+    fetched = sum(1 for u in users if u not in done)
+    print(f"\n✅  Done! {fetched} profiles fetched in {elapsed}s.")
+    print(f"   Sorted results saved to: {output_path.resolve()}\n")
+
 
 if __name__ == "__main__":
     main()
